@@ -164,6 +164,69 @@ final class GL_Abandoned_Carts {
 
     public function menu(){ add_submenu_page('woocommerce','Брошенные корзины','Брошенные корзины','manage_woocommerce','gl-abandoned-carts',[$this,'page']); }
 
+    private function checkout_label($key){
+        $labels=[
+            'billing_first_name'=>'Имя','billing_last_name'=>'Фамилия','billing_company'=>'Компания',
+            'billing_country'=>'Страна (платёжный адрес)','billing_state'=>'Регион (платёжный адрес)',
+            'billing_city'=>'Город (платёжный адрес)','billing_postcode'=>'Индекс (платёжный адрес)',
+            'billing_address_1'=>'Адрес плательщика','billing_address_2'=>'Дополнение к адресу плательщика',
+            'billing_phone'=>'Телефон','billing_email'=>'Электронная почта',
+            'shipping_first_name'=>'Имя получателя','shipping_last_name'=>'Фамилия получателя',
+            'shipping_company'=>'Компания получателя','shipping_country'=>'Страна доставки',
+            'shipping_state'=>'Регион доставки','shipping_city'=>'Город доставки',
+            'shipping_postcode'=>'Индекс доставки','shipping_address_1'=>'Адрес доставки',
+            'shipping_address_2'=>'Дополнение к адресу доставки','ship_to_different_address'=>'Доставка по другому адресу',
+            'shipping_method'=>'Способ доставки','payment_method'=>'Способ оплаты',
+            'order_comments'=>'Комментарий к заказу','coupon_code'=>'Промокод',
+        ];
+        if(isset($labels[$key])) return $labels[$key];
+        $label=str_replace(['billing_','shipping_'],['',''],$key);
+        return ucfirst(str_replace(['_','-'],' ',$label));
+    }
+
+    private function checkout_value($key,$value){
+        if(is_array($value)){
+            $values=[];
+            foreach($value as $item){
+                $formatted=$this->checkout_value($key,$item);
+                if($formatted!=='') $values[]=$formatted;
+            }
+            return implode(', ',$values);
+        }
+        $value=trim((string)$value);
+        if($value==='') return '';
+        if($key==='ship_to_different_address') return $value==='1' ? 'Да' : 'Нет';
+        if($key==='payment_method' && function_exists('WC')){
+            $gateways=WC()->payment_gateways() ? WC()->payment_gateways()->payment_gateways() : [];
+            if(isset($gateways[$value])) return $gateways[$value]->get_title();
+        }
+        if($key==='shipping_method' && preg_match('/:(\d+)$/',$value,$match) && class_exists('WC_Shipping_Zones')){
+            $method=WC_Shipping_Zones::get_shipping_method((int)$match[1]);
+            if($method) return $method->get_title();
+        }
+        if(in_array($key,['billing_country','shipping_country'],true) && function_exists('WC') && WC()->countries){
+            $countries=WC()->countries->get_countries();
+            if(isset($countries[$value])) return $countries[$value];
+        }
+        return $value;
+    }
+
+    private function render_checkout_data(array $checkout){
+        $hidden=['_wpnonce','_wp_http_referer','woocommerce-process-checkout-nonce','terms-field'];
+        echo '<details class="gl-ac-checkout"><summary>Введённые данные</summary><dl style="margin:8px 0 0;display:grid;grid-template-columns:max-content minmax(120px,1fr);gap:4px 12px;max-width:640px">';
+        $shown=false;
+        foreach($checkout as $key=>$raw){
+            $key=(string)$key;
+            if(in_array($key,$hidden,true) || strpos($key,'wc_order_attribution_')===0) continue;
+            $value=$this->checkout_value($key,$raw);
+            if($value==='') continue;
+            echo '<dt style="font-weight:600">'.esc_html($this->checkout_label($key)).':</dt><dd style="margin:0;overflow-wrap:anywhere">'.esc_html($value).'</dd>';
+            $shown=true;
+        }
+        if(!$shown) echo '<dt>Нет дополнительных данных</dt>';
+        echo '</dl></details>';
+    }
+
     public function page(){
         if(!current_user_can('manage_woocommerce')) wp_die('Forbidden');
         global $wpdb;
@@ -182,7 +245,7 @@ final class GL_Abandoned_Carts {
             echo $r->phone?'<div>'.esc_html($r->phone).'</div>':''; echo $r->email?'<div>'.esc_html($r->email).'</div>':''; if(!$r->phone&&!$r->email) echo '—';
             echo '</td><td>';
             foreach($items as $it){ echo '<div><a target="_blank" href="'.esc_url($it['url'] ?? '#').'">'.esc_html($it['name'] ?? 'Товар').'</a> × '.(int)($it['quantity']??1).'</div>'; }
-            if($checkout){ echo '<details><summary>Введённые данные</summary><pre style="white-space:pre-wrap;max-width:480px">'.esc_html(print_r($checkout,true)).'</pre></details>'; }
+            if($checkout) $this->render_checkout_data($checkout);
             echo '</td><td>'.wp_kses_post(wc_price((float)$r->cart_total,['currency'=>$r->currency ?: get_woocommerce_currency()])).'</td><td>'.esc_html($r->status).'</td><td>'.esc_html($r->updated_at).'</td><td>';
             $del=wp_nonce_url(admin_url('admin-post.php?action=gl_ac_delete&id='.(int)$r->id),'gl_ac_delete_'.(int)$r->id);
             echo '<a href="'.esc_url($del).'" onclick="return confirm(\'Удалить запись?\')">Удалить</a></td></tr>';
