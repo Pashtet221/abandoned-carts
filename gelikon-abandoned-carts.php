@@ -167,7 +167,8 @@ final class GL_Abandoned_Carts {
         $menu_title='Брошенные корзины';
         if($count>0){
             $formatted_count=number_format_i18n($count);
-            $menu_title.=' <span class="awaiting-mod count-'.(int)$count.'"><span class="pending-count" aria-hidden="true">'.esc_html($formatted_count).'</span><span class="screen-reader-text">'.esc_html(sprintf('Количество брошенных корзин: %s',$formatted_count)).'</span></span>';
+            $badge_style='display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;min-width:18px;height:18px;padding:0 5px;margin-left:5px;border-radius:9px;background:#2271b1;color:#fff;font-size:11px;font-weight:600;line-height:18px;vertical-align:middle;';
+            $menu_title.=' <span class="awaiting-mod count-'.(int)$count.'" style="'.esc_attr($badge_style).'"><span class="pending-count" aria-hidden="true">'.esc_html($formatted_count).'</span><span class="screen-reader-text">'.esc_html(sprintf('Количество брошенных корзин: %s',$formatted_count)).'</span></span>';
         }
         add_submenu_page('woocommerce','Брошенные корзины',$menu_title,'manage_woocommerce','gl-abandoned-carts',[$this,'page']);
     }
