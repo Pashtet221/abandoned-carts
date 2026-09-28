@@ -162,7 +162,20 @@ final class GL_Abandoned_Carts {
         $wpdb->update($this->table(),['status'=>'completed','completed_order_id'=>(int)$order_id,'updated_at'=>current_time('mysql')],['session_key'=>$session]);
     }
 
-    public function menu(){ add_submenu_page('woocommerce','Брошенные корзины','Брошенные корзины','manage_woocommerce','gl-abandoned-carts',[$this,'page']); }
+    public function menu(){
+        $count=$this->abandoned_count();
+        $menu_title='Брошенные корзины';
+        if($count>0){
+            $formatted_count=number_format_i18n($count);
+            $menu_title.=' <span class="awaiting-mod count-'.(int)$count.'"><span class="pending-count" aria-hidden="true">'.esc_html($formatted_count).'</span><span class="screen-reader-text">'.esc_html(sprintf('Количество брошенных корзин: %s',$formatted_count)).'</span></span>';
+        }
+        add_submenu_page('woocommerce','Брошенные корзины',$menu_title,'manage_woocommerce','gl-abandoned-carts',[$this,'page']);
+    }
+
+    private function abandoned_count(){
+        global $wpdb;
+        return (int)$wpdb->get_var("SELECT COUNT(*) FROM {$this->table()} WHERE status='abandoned'");
+    }
 
     private function checkout_label($key){
         $labels=[
