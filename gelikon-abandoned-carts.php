@@ -36,6 +36,8 @@ final class GL_Abandoned_Carts {
         add_action(self::CRON, [$this,'mark_abandoned']);
         add_action('admin_menu', [$this,'menu']);
         add_action('admin_post_gl_ac_delete', [$this,'delete']);
+        add_action('admin_post_gl_ac_bulk_delete', [$this,'bulk_delete']);
+        add_action('admin_enqueue_scripts', [$this,'enqueue_admin']);
     }
 
     public function declare_hpos(){
@@ -241,6 +243,11 @@ final class GL_Abandoned_Carts {
         echo '</dl></details>';
     }
 
+    public function enqueue_admin($hook){
+        if($hook!=='woocommerce_page_gl-abandoned-carts') return;
+        wp_enqueue_script('gl-ac-admin', plugin_dir_url(__FILE__).'assets/js/admin.js', [], self::VERSION, true);
+    }
+
     public function page(){
         if(!current_user_can('manage_woocommerce')) wp_die('Forbidden');
         global $wpdb;
@@ -251,11 +258,15 @@ final class GL_Abandoned_Carts {
         foreach(['abandoned'=>'Брошенные','active'=>'Активные','completed'=>'Завершённые','all'=>'Все'] as $k=>$label){
             $url=admin_url('admin.php?page=gl-abandoned-carts&status='.$k); echo '<a class="button '.($k===$status?'button-primary':'').'" href="'.esc_url($url).'">'.esc_html($label).'</a> ';
         }
-        echo '</p><table class="widefat striped"><thead><tr><th>ID</th><th>Покупатель</th><th>Контакты</th><th>Корзина</th><th>Сумма</th><th>Статус</th><th>Последняя активность</th><th></th></tr></thead><tbody>';
-        if(!$rows) echo '<tr><td colspan="8">Записей нет.</td></tr>';
+        echo '</p><form id="gl-ac-bulk-form" method="post" action="'.esc_url(admin_url('admin-post.php')).'">';
+        echo '<input type="hidden" name="action" value="gl_ac_bulk_delete"><input type="hidden" name="status" value="'.esc_attr($status).'">';
+        wp_nonce_field('gl_ac_bulk_delete');
+        echo '<p><button type="submit" class="button" id="gl-ac-delete-selected" disabled>Удалить выбранные</button> <span>«Выбрать все» отмечает только показанные записи (до 200).</span></p>';
+        echo '<table class="widefat striped"><thead><tr><td class="check-column"><input type="checkbox" id="gl-ac-select-all" aria-label="Выбрать все показанные корзины"></td><th>ID</th><th>Покупатель</th><th>Контакты</th><th>Корзина</th><th>Сумма</th><th>Статус</th><th>Последняя активность</th><th></th></tr></thead><tbody>';
+        if(!$rows) echo '<tr><td colspan="9">Записей нет.</td></tr>';
         foreach($rows as $r){
             $items=json_decode($r->cart_contents,true) ?: []; $checkout=json_decode($r->checkout_data,true) ?: [];
-            echo '<tr><td>#'.(int)$r->id.'</td><td><strong>'.esc_html($r->customer_name ?: 'Гость').'</strong></td><td>';
+            echo '<tr><th scope="row" class="check-column"><input type="checkbox" name="cart_ids[]" value="'.(int)$r->id.'" aria-label="Выбрать корзину #'.(int)$r->id.'"></th><td>#'.(int)$r->id.'</td><td><strong>'.esc_html($r->customer_name ?: 'Гость').'</strong></td><td>';
             echo $r->phone?'<div>'.esc_html($r->phone).'</div>':''; echo $r->email?'<div>'.esc_html($r->email).'</div>':''; if(!$r->phone&&!$r->email) echo '—';
             echo '</td><td>';
             foreach($items as $it){ echo '<div><a target="_blank" href="'.esc_url($it['url'] ?? '#').'">'.esc_html($it['name'] ?? 'Товар').'</a> × '.(int)($it['quantity']??1).'</div>'; }
@@ -264,7 +275,28 @@ final class GL_Abandoned_Carts {
             $del=wp_nonce_url(admin_url('admin-post.php?action=gl_ac_delete&id='.(int)$r->id),'gl_ac_delete_'.(int)$r->id);
             echo '<a href="'.esc_url($del).'" onclick="return confirm(\'Удалить запись?\')">Удалить</a></td></tr>';
         }
-        echo '</tbody></table></div>';
+        echo '</tbody></table></form></div>';
+    }
+
+    public function bulk_delete(){
+        if(!current_user_can('manage_woocommerce')) wp_die('Forbidden', '', ['response'=>403]);
+        if(($_SERVER['REQUEST_METHOD'] ?? '')!=='POST') wp_die('Method not allowed', '', ['response'=>405]);
+        check_admin_referer('gl_ac_bulk_delete');
+        $raw=isset($_POST['cart_ids']) && is_array($_POST['cart_ids']) ? wp_unslash($_POST['cart_ids']) : [];
+        $ids=[];
+        foreach($raw as $id){
+            if(is_scalar($id) && ctype_digit((string)$id) && (int)$id>0) $ids[]=(int)$id;
+        }
+        $ids=array_values(array_unique($ids));
+        global $wpdb;
+        foreach(array_chunk($ids,200) as $chunk){
+            $placeholders=implode(',',array_fill(0,count($chunk),'%d'));
+            $wpdb->query($wpdb->prepare("DELETE FROM {$this->table()} WHERE id IN ($placeholders)",$chunk));
+        }
+        $status=isset($_POST['status']) && is_string($_POST['status']) ? sanitize_key(wp_unslash($_POST['status'])) : 'abandoned';
+        if(!in_array($status,['abandoned','active','completed','all'],true)) $status='abandoned';
+        wp_safe_redirect(admin_url('admin.php?page=gl-abandoned-carts&status='.$status));
+        exit;
     }
 
     public function delete(){
