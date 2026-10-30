@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Gelikon Abandoned Carts
  * Description: Tracks WooCommerce carts and checkout data before order completion and shows abandoned carts in wp-admin.
- * Version: 1.0.0
+ * Version: 1.1.0
  * Author: WPDevStudio
  * Requires PHP: 7.4
  */
@@ -10,7 +10,7 @@
 if (!defined('ABSPATH')) exit;
 
 final class GL_Abandoned_Carts {
-    const VERSION = '1.0.0';
+    const VERSION = '1.1.0';
     const CRON = 'gl_ac_mark_abandoned';
     const NONCE = 'gl_ac_capture';
     private static $instance;
@@ -28,11 +28,15 @@ final class GL_Abandoned_Carts {
         add_action('wp_enqueue_scripts', [$this,'enqueue']);
         add_action('wp_ajax_gl_ac_capture', [$this,'ajax_capture']);
         add_action('wp_ajax_nopriv_gl_ac_capture', [$this,'ajax_capture']);
-        add_action('woocommerce_add_to_cart', [$this,'capture_cart']);
+        add_action('woocommerce_add_to_cart', [$this,'new_cart']);
         add_action('woocommerce_after_cart_item_quantity_update', [$this,'capture_cart']);
         add_action('woocommerce_cart_item_removed', [$this,'capture_cart']);
         add_action('woocommerce_cart_emptied', [$this,'capture_cart']);
         add_action('woocommerce_checkout_order_processed', [$this,'order_processed'], 10, 3);
+        add_action('woocommerce_checkout_create_order', [$this,'link_order']);
+        add_action('woocommerce_store_api_checkout_order_processed', [$this,'block_order_processed']);
+        add_action('woocommerce_payment_complete', [$this,'sync_order']);
+        add_action('woocommerce_order_status_changed', [$this,'sync_order']);
         add_action(self::CRON, [$this,'mark_abandoned']);
         add_action('admin_menu', [$this,'menu']);
         add_action('admin_post_gl_ac_delete', [$this,'delete']);
@@ -106,6 +110,16 @@ final class GL_Abandoned_Carts {
     }
 
     private function val($data,$key){ return isset($data[$key]) ? sanitize_text_field(wp_unslash($data[$key])) : ''; }
+    private function current_cart(){
+        global $wpdb;
+        $session=$this->session_key();
+        if(!$session) return null;
+        $row=$wpdb->get_row($wpdb->prepare("SELECT * FROM {$this->table()} WHERE session_key=%s",$session));
+        // WooCommerce carries session data across guest-to-account login.
+        $id=absint(WC()->session->get('gl_ac_cart_id'));
+        return $row ?: ($id ? $wpdb->get_row($wpdb->prepare("SELECT * FROM {$this->table()} WHERE id=%d",$id)) : null);
+    }
+
     private function clean($value){
         if (is_array($value)){ $out=[]; foreach($value as $k=>$v) $out[sanitize_key((string)$k)]=$this->clean($v); return $out; }
         return is_scalar($value) ? sanitize_text_field((string)$value) : '';
@@ -115,6 +129,10 @@ final class GL_Abandoned_Carts {
         if (!function_exists('WC') || !WC()->session || !WC()->cart) return;
         global $wpdb;
         $session = $this->session_key(); if (!$session) return;
+        $existing=$this->current_cart();
+        // A checkout snapshot belongs to its order, not to subsequent AJAX requests.
+        if($existing && ((int)$existing->completed_order_id || $existing->status==='completed')) return;
+        if($existing) $checkout=array_merge(json_decode($existing->checkout_data,true) ?: [],$checkout);
         $items=[];
         foreach(WC()->cart->get_cart() as $item){
             $product = $item['data'] ?? null; if (!$product) continue;
@@ -147,21 +165,84 @@ final class GL_Abandoned_Carts {
             'currency'=>get_woocommerce_currency(),'checkout_data'=>wp_json_encode($this->clean($checkout),JSON_UNESCAPED_UNICODE),
             'updated_at'=>$now,'abandoned_at'=>null
         ];
-        $id=$wpdb->get_var($wpdb->prepare("SELECT id FROM {$this->table()} WHERE session_key=%s",$session));
-        if($id) $wpdb->update($this->table(),$row,['id'=>(int)$id]);
-        else { $row['created_at']=$now; $wpdb->insert($this->table(),$row); }
+        if($existing) {
+            // Do not overwrite an order linked by another request after our initial read.
+            $wpdb->update($this->table(),$row,['id'=>(int)$existing->id,'completed_order_id'=>0,'status'=>$existing->status]);
+            WC()->session->set('gl_ac_cart_id',(int)$existing->id);
+        } else {
+            $row['created_at']=$now;
+            if($wpdb->insert($this->table(),$row)) WC()->session->set('gl_ac_cart_id',(int)$wpdb->insert_id);
+        }
     }
 
     public function mark_abandoned(){
         global $wpdb;
+        // Repair older linked records too, in bounded batches without requiring a browser session.
+        $cursor=absint(get_option('gl_ac_reconcile_cursor',0));
+        $rows=$wpdb->get_results($wpdb->prepare("SELECT id, completed_order_id FROM {$this->table()} WHERE completed_order_id>0 AND id>%d ORDER BY id LIMIT 100",$cursor));
+        foreach($rows as $row) $this->sync_order((int)$row->completed_order_id);
+        update_option('gl_ac_reconcile_cursor',count($rows)===100 ? (int)end($rows)->id : 0,false);
         $minutes=max(5,absint(get_option('gl_ac_timeout',30)));
         $cutoff=date_i18n('Y-m-d H:i:s', current_time('timestamp')-$minutes*MINUTE_IN_SECONDS);
         $wpdb->query($wpdb->prepare("UPDATE {$this->table()} SET status='abandoned', abandoned_at=%s WHERE status='active' AND updated_at < %s AND cart_contents <> '[]'", current_time('mysql'), $cutoff));
     }
 
-    public function order_processed($order_id,$posted_data,$order){
-        global $wpdb; $session=$this->session_key(); if(!$session) return;
-        $wpdb->update($this->table(),['status'=>'completed','completed_order_id'=>(int)$order_id,'updated_at'=>current_time('mysql')],['session_key'=>$session]);
+    public function new_cart(){
+        global $wpdb;
+        $session=$this->session_key();
+        if(!$session) return;
+        // Free the unique session key while retaining the previous purchase's history.
+        $row=$this->current_cart();
+        if($row && ((int)$row->completed_order_id || $row->status==='completed')) {
+            $wpdb->update($this->table(),['session_key'=>'history:'.$row->id],['id'=>(int)$row->id]);
+            WC()->session->set('gl_ac_cart_id',null);
+        }
+        $this->capture_cart();
+    }
+
+    public function link_order($order){
+        if(!$order instanceof WC_Order || $order->get_meta('_gl_ac_cart_id')) return;
+        global $wpdb;
+        $session=$this->session_key();
+        if(!$session) return;
+        $this->capture_cart();
+        $row=$this->current_cart();
+        if($row && (!(int)$row->completed_order_id || (int)$row->completed_order_id===$order->get_id())) {
+            $order->update_meta_data('_gl_ac_cart_id',(int)$row->id);
+        }
+    }
+
+    public function order_processed($order_id,$posted_data=[],$order=null){
+        $order=$order instanceof WC_Order ? $order : wc_get_order($order_id);
+        if(!$order) return;
+        $this->link_order($order);
+        $order->save();
+        $this->sync_order($order->get_id());
+    }
+
+    public function block_order_processed($order){
+        $this->order_processed($order->get_id(),[],$order);
+    }
+
+    public function sync_order($order_id){
+        $order=wc_get_order($order_id);
+        if(!$order || $order->has_status(['checkout-draft','auto-draft'])) return;
+        global $wpdb;
+        $id=absint($order->get_meta('_gl_ac_cart_id'));
+        if($id) {
+            $row=$wpdb->get_row($wpdb->prepare("SELECT id, completed_order_id FROM {$this->table()} WHERE id=%d",$id));
+            if(!$row || ((int)$row->completed_order_id && (int)$row->completed_order_id!==(int)$order_id)) return;
+        } else {
+            // Legacy orders have no metadata; only use an explicit existing order link.
+            $id=(int)$wpdb->get_var($wpdb->prepare("SELECT id FROM {$this->table()} WHERE completed_order_id=%d",$order_id));
+        }
+        if(!$id) return;
+        $status=$order->is_paid() || $order->has_status('refunded') ? 'completed' : ($order->has_status(['failed','cancelled']) ? 'abandoned' : 'ordered');
+        $wpdb->update($this->table(),[
+            'status'=>$status,'completed_order_id'=>(int)$order_id,
+            'updated_at'=>current_time('mysql'),
+            'abandoned_at'=>$status==='abandoned' ? current_time('mysql') : null,
+        ],['id'=>$id]);
     }
 
     public function menu(){
@@ -252,10 +333,10 @@ final class GL_Abandoned_Carts {
         if(!current_user_can('manage_woocommerce')) wp_die('Forbidden');
         global $wpdb;
         $status=isset($_GET['status'])?sanitize_key($_GET['status']):'abandoned';
-        $allowed=['abandoned','active','completed','all']; if(!in_array($status,$allowed,true)) $status='abandoned';
+        $allowed=['abandoned','active','ordered','completed','all']; if(!in_array($status,$allowed,true)) $status='abandoned';
         $rows=$status==='all' ? $wpdb->get_results("SELECT * FROM {$this->table()} ORDER BY updated_at DESC LIMIT 200") : $wpdb->get_results($wpdb->prepare("SELECT * FROM {$this->table()} WHERE status=%s ORDER BY updated_at DESC LIMIT 200",$status));
         echo '<div class="wrap"><h1>Брошенные корзины</h1><p>Корзина считается брошенной после '.esc_html(get_option('gl_ac_timeout',30)).' минут без активности.</p><p>';
-        foreach(['abandoned'=>'Брошенные','active'=>'Активные','completed'=>'Завершённые','all'=>'Все'] as $k=>$label){
+        foreach(['abandoned'=>'Брошенные','active'=>'Активные','ordered'=>'Ожидают оплаты','completed'=>'Завершённые','all'=>'Все'] as $k=>$label){
             $url=admin_url('admin.php?page=gl-abandoned-carts&status='.$k); echo '<a class="button '.($k===$status?'button-primary':'').'" href="'.esc_url($url).'">'.esc_html($label).'</a> ';
         }
         echo '</p><form id="gl-ac-bulk-form" method="post" action="'.esc_url(admin_url('admin-post.php')).'">';
@@ -294,7 +375,7 @@ final class GL_Abandoned_Carts {
             $wpdb->query($wpdb->prepare("DELETE FROM {$this->table()} WHERE id IN ($placeholders)",$chunk));
         }
         $status=isset($_POST['status']) && is_string($_POST['status']) ? sanitize_key(wp_unslash($_POST['status'])) : 'abandoned';
-        if(!in_array($status,['abandoned','active','completed','all'],true)) $status='abandoned';
+        if(!in_array($status,['abandoned','active','ordered','completed','all'],true)) $status='abandoned';
         wp_safe_redirect(admin_url('admin.php?page=gl-abandoned-carts&status='.$status));
         exit;
     }
